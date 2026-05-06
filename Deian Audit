@@ -1,0 +1,553 @@
+#!/bin/bash
+# =============================================================================
+# debian_audit.sh — Audit all changes since initial Debian install
+# Generates: debian_reinstall.sh (full rebuild script)
+#
+# Usage:  sudo bash debian_audit.sh [--baseline-pkg openssh-server] [--output FILE]
+#         sudo bash debian_audit.sh --help
+# =============================================================================
+
+set -uo pipefail
+# NOTE: intentionally NOT using -e (errexit) — many audit commands return
+# non-zero legitimately (dpkg -S miss, debsums diff, empty globs, etc.)
+# We handle errors explicitly per-section instead.
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok()      { echo -e "${GREEN}[ OK ]${NC}  $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+err()     { echo -e "${RED}[ERR ]${NC}  $*"; }
+section() { echo -e "\n${BOLD}${CYAN}━━━  $*  ━━━${NC}"; }
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+BASELINE_PKG="openssh-server"
+OUTPUT_SCRIPT="debian_reinstall.sh"
+
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --baseline-pkg) BASELINE_PKG="$2"; shift 2 ;;
+    --output)       OUTPUT_SCRIPT="$2"; shift 2 ;;
+    --help)
+      echo "Usage: sudo bash debian_audit.sh [--baseline-pkg PKG] [--output FILE]"
+      echo "  --baseline-pkg   Package present at initial install (default: openssh-server)"
+      echo "  --output         Output script filename (default: debian_reinstall.sh)"
+      exit 0 ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+# ── Root check ────────────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+  echo -e "${RED}[ERROR]${NC} Run as root: sudo bash $0" >&2
+  exit 1
+fi
+
+# ── Work dir (cleaned up on exit) ─────────────────────────────────────────────
+WORK_DIR="$(mktemp -d /tmp/debian_audit.XXXXXX)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+echo -e "${BOLD}"
+echo "╔══════════════════════════════════════════════════╗"
+echo "║        Debian System Audit & Rebuild Planner     ║"
+echo "╚══════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+# =============================================================================
+# 1. DETECT INSTALL BASELINE
+# =============================================================================
+section "1. Detecting install baseline"
+
+BASELINE_FILE=""
+for f in /var/log/installer/syslog /var/log/installer/syslog.gz; do
+  [[ -f "$f" ]] && { BASELINE_FILE="$f"; break; }
+done
+
+BASELINE_REF="$WORK_DIR/baseline_ref"
+
+if [[ -n "$BASELINE_FILE" ]]; then
+  touch -r "$BASELINE_FILE" "$BASELINE_REF"
+  if [[ "$BASELINE_FILE" == *.gz ]]; then
+    BASELINE_DATE=$(zcat "$BASELINE_FILE" 2>/dev/null | head -1 | awk '{print $1, $2}')
+  else
+    BASELINE_DATE=$(head -1 "$BASELINE_FILE" | awk '{print $1, $2}')
+  fi
+  info "Baseline source : $BASELINE_FILE"
+  info "Baseline date   : $BASELINE_DATE"
+else
+  warn "No installer syslog found; trying dpkg.log for $BASELINE_PKG"
+  BASELINE_DATE=$(grep -h " install ${BASELINE_PKG}:" \
+    /var/log/dpkg.log 2>/dev/null \
+    | head -1 | awk '{print $1, $2}' || true)
+  if [[ -z "$BASELINE_DATE" ]]; then
+    warn "Falling back to process 1 birth time"
+    BASELINE_DATE=$(stat -c %y /proc/1 2>/dev/null | cut -d. -f1 || echo "unknown")
+  fi
+  info "Estimated baseline: $BASELINE_DATE"
+  touch "$BASELINE_REF"
+fi
+
+ok "Baseline reference set"
+
+# =============================================================================
+# 2. MANUALLY INSTALLED PACKAGES
+# =============================================================================
+section "2. Collecting manually installed packages"
+
+apt-mark showmanual 2>/dev/null | sort > "$WORK_DIR/manual_all.txt"
+
+apt-cache depends --recurse --no-recommends --no-suggests \
+  --no-conflicts --no-breaks --no-replaces --no-enhances \
+  "$BASELINE_PKG" 2>/dev/null \
+  | grep '^[a-zA-Z]' \
+  | sort -u > "$WORK_DIR/baseline_deps.txt"
+
+echo "$BASELINE_PKG" >> "$WORK_DIR/baseline_deps.txt"
+
+# Use dpkg-query directly — avoids the xargs+apt-cache pipeline that breaks with set -e
+dpkg-query -W -f='${Package} ${Priority}\n' 2>/dev/null \
+  | awk '$2 ~ /^(required|important|standard)$/ {print $1}' \
+  | sort -u >> "$WORK_DIR/baseline_deps.txt"
+
+sort -u "$WORK_DIR/baseline_deps.txt" -o "$WORK_DIR/baseline_deps.txt"
+
+comm -23 "$WORK_DIR/manual_all.txt" "$WORK_DIR/baseline_deps.txt" \
+  > "$WORK_DIR/packages_to_install.txt"
+
+ok "Found $(wc -l < "$WORK_DIR/packages_to_install.txt") manually installed packages (post-install)"
+
+# =============================================================================
+# 3. INSTALL ORDER FROM DPKG LOGS
+# =============================================================================
+section "3. Reconstructing install order from dpkg logs"
+
+: > "$WORK_DIR/dpkg_install_log.txt"
+
+[[ -f /var/log/dpkg.log ]] && grep " install " /var/log/dpkg.log >> "$WORK_DIR/dpkg_install_log.txt" || true
+
+# Use find instead of ls to safely handle missing files
+while IFS= read -r f; do
+  if [[ "$f" == *.gz ]]; then
+    zcat "$f" 2>/dev/null | grep " install " >> "$WORK_DIR/dpkg_install_log.txt" || true
+  else
+    grep " install " "$f" >> "$WORK_DIR/dpkg_install_log.txt" || true
+  fi
+done < <(find /var/log -maxdepth 1 -name 'dpkg.log.*' 2>/dev/null | sort -t. -k3 -rn)
+
+sort "$WORK_DIR/dpkg_install_log.txt" -o "$WORK_DIR/dpkg_install_log.txt"
+ok "dpkg install log reconstructed ($(wc -l < "$WORK_DIR/dpkg_install_log.txt") entries)"
+
+# =============================================================================
+# 4. CHANGED CONFIG FILES IN /etc
+# =============================================================================
+section "4. Scanning for changed config files in /etc"
+
+CHANGED_CONFIGS="$WORK_DIR/changed_configs.txt"
+: > "$CHANGED_CONFIGS"
+
+find /etc -newer "$BASELINE_REF" -type f 2>/dev/null \
+  | grep -vE '\.(dpkg-old|dpkg-dist|dpkg-new|bak|swp|~)$' \
+  | sort >> "$CHANGED_CONFIGS" || true
+
+if command -v debsums &>/dev/null; then
+  debsums -c 2>/dev/null \
+    | awk '{print $1}' \
+    | grep '^/etc/' >> "$CHANGED_CONFIGS" || true
+else
+  warn "debsums not installed — install for better config detection: apt-get install -y debsums"
+fi
+
+sort -u "$CHANGED_CONFIGS" -o "$CHANGED_CONFIGS"
+ok "Found $(wc -l < "$CHANGED_CONFIGS") changed config files"
+
+# =============================================================================
+# 5. UNPACKAGED FILES IN /etc
+# =============================================================================
+section "5. Finding unpackaged files in /etc"
+
+UNOWNED="$WORK_DIR/unowned_etc.txt"
+: > "$UNOWNED"
+
+while IFS= read -r f; do
+  [[ -f "$f" ]] || continue
+  if ! dpkg -S "$f" >/dev/null 2>&1; then
+    echo "$f" >> "$UNOWNED"
+  fi
+done < "$CHANGED_CONFIGS"
+
+ok "Found $(wc -l < "$UNOWNED") unpackaged/new files in /etc"
+
+# =============================================================================
+# 6. ENABLED SYSTEMD UNITS
+# =============================================================================
+section "6. Detecting enabled systemd units"
+
+ENABLED_UNITS="$WORK_DIR/enabled_units.txt"
+
+systemctl list-unit-files --state=enabled --no-legend 2>/dev/null \
+  | awk '{print $1}' \
+  | grep -vE '^(getty|autovt|remote-fs|sysinit|basic|multi-user|graphical|rescue|emergency|systemd-)' \
+  | sort > "$ENABLED_UNITS" || true
+
+DEFAULT_UNITS=(
+  ssh.service cron.service rsyslog.service networking.service
+  NetworkManager.service apt-daily.timer apt-daily-upgrade.timer
+  fstrim.timer logrotate.timer man-db.timer
+)
+for u in "${DEFAULT_UNITS[@]}"; do
+  sed -i "/^${u}$/d" "$ENABLED_UNITS" 2>/dev/null || true
+done
+
+ok "Found $(wc -l < "$ENABLED_UNITS") non-default enabled units"
+
+# =============================================================================
+# 7. CRON JOBS
+# =============================================================================
+section "7. Collecting cron jobs"
+
+CRONS="$WORK_DIR/crons.txt"
+: > "$CRONS"
+
+for f in /etc/crontab /etc/cron.d/*; do
+  [[ -f "$f" ]] || continue
+  echo "# --- $f ---" >> "$CRONS"
+  cat "$f" >> "$CRONS"
+  echo "" >> "$CRONS"
+done
+
+for dir in /root /home/*; do
+  [[ -d "$dir" ]] || continue
+  u=$(basename "$dir")
+  ctab=$(crontab -l -u "$u" 2>/dev/null || true)
+  if [[ -n "$ctab" ]]; then
+    echo "# --- crontab: $u ---" >> "$CRONS"
+    echo "$ctab" >> "$CRONS"
+    echo "" >> "$CRONS"
+  fi
+done
+
+ok "Cron collection done"
+
+# =============================================================================
+# 8. USERS & GROUPS
+# =============================================================================
+section "8. Detecting added users and groups"
+
+USERS="$WORK_DIR/users.txt"
+GROUPS_FILE="$WORK_DIR/groups.txt"
+
+awk -F: '$3 >= 1000 && $3 < 65534 {print $1, $3, $6, $7}' /etc/passwd > "$USERS"
+awk -F: '$3 >= 1000 && $3 < 65534 {print $1, $3}'         /etc/group  > "$GROUPS_FILE"
+
+ok "Found $(wc -l < "$USERS") non-system users, $(wc -l < "$GROUPS_FILE") non-system groups"
+
+# =============================================================================
+# 9. FIREWALL RULES
+# =============================================================================
+section "9. Capturing firewall rules"
+
+FIREWALL="$WORK_DIR/firewall.txt"
+: > "$FIREWALL"
+
+if command -v ufw &>/dev/null; then
+  ufw_status=$(ufw status 2>/dev/null || true)
+  if echo "$ufw_status" | grep -q "Status: active"; then
+    echo "# UFW rules" >> "$FIREWALL"
+    ufw status numbered >> "$FIREWALL" 2>/dev/null || true
+  else
+    echo "# UFW installed but inactive" >> "$FIREWALL"
+  fi
+elif command -v iptables &>/dev/null; then
+  echo "# iptables-save output" >> "$FIREWALL"
+  iptables-save >> "$FIREWALL" 2>/dev/null || true
+fi
+
+ok "Firewall rules captured"
+
+# =============================================================================
+# 10. CUSTOM APT SOURCES
+# =============================================================================
+section "10. Detecting custom apt sources"
+
+APT_SOURCES="$WORK_DIR/apt_sources.txt"
+: > "$APT_SOURCES"
+
+grep -rh "^deb " /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+  | grep -v "debian\.org" \
+  | sort -u >> "$APT_SOURCES" || true
+
+ok "Found $(wc -l < "$APT_SOURCES") custom apt sources"
+
+# =============================================================================
+# 11. GENERATE THE REINSTALL SCRIPT
+# =============================================================================
+section "11. Generating $OUTPUT_SCRIPT"
+
+HOSTNAME_VAL=$(hostname)
+DEBIAN_VERSION=$(cat /etc/debian_version 2>/dev/null || echo "unknown")
+GEN_DATE=$(date '+%Y-%m-%d %H:%M:%S')
+
+# --- Script header (single-quoted heredoc: no expansion inside) ---
+cat > "$OUTPUT_SCRIPT" << 'SCRIPT_HEADER'
+#!/bin/bash
+# =============================================================================
+# debian_reinstall.sh — Auto-generated system rebuild script
+# =============================================================================
+# INSTRUCTIONS:
+#   1. Copy this script to your new Debian machine
+#   2. Review every section — comment out anything not needed
+#   3. Run: sudo bash debian_reinstall.sh
+# =============================================================================
+
+set -uo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok()      { echo -e "${GREEN}[ OK ]${NC}  $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+die()     { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+section() { echo -e "\n${BOLD}${CYAN}━━━  $*  ━━━${NC}"; }
+
+[[ $EUID -ne 0 ]] && die "Run as root: sudo bash $0"
+
+SCRIPT_HEADER
+
+# --- Metadata (double-quoted: variables expand from the audit environment) ---
+cat >> "$OUTPUT_SCRIPT" << METADATA
+# Generated : $GEN_DATE
+# Source    : $HOSTNAME_VAL  (Debian $DEBIAN_VERSION)
+# Baseline  : $BASELINE_PKG
+
+METADATA
+
+# ── SECTION 1: APT SOURCES ────────────────────────────────────────────────────
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+# =============================================================================
+# SECTION 1 — Custom APT Sources
+# =============================================================================
+section "1. Custom APT sources"
+
+SECTION
+
+if [[ -s "$APT_SOURCES" ]]; then
+  echo "# Uncomment lines below that you need, then re-run apt-get update" >> "$OUTPUT_SCRIPT"
+  while IFS= read -r line; do
+    printf '# echo %q >> /etc/apt/sources.list.d/custom.list\n' "$line" >> "$OUTPUT_SCRIPT"
+  done < "$APT_SOURCES"
+else
+  echo 'info "No custom APT sources detected"' >> "$OUTPUT_SCRIPT"
+fi
+
+# ── SECTION 2: PACKAGES ───────────────────────────────────────────────────────
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+
+# =============================================================================
+# SECTION 2 — Package Installation
+# =============================================================================
+section "2. Installing packages"
+
+apt-get update -qq
+
+PACKAGES=(
+SECTION
+
+while IFS= read -r pkg; do
+  [[ -z "$pkg" ]] && continue
+  printf '  %s\n' "$pkg" >> "$OUTPUT_SCRIPT"
+done < "$WORK_DIR/packages_to_install.txt"
+
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+)
+
+if [[ ${#PACKAGES[@]} -gt 0 ]]; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${PACKAGES[@]}"
+  ok "Packages installed"
+else
+  info "No packages to install"
+fi
+
+SECTION
+
+# ── SECTION 3: USERS ──────────────────────────────────────────────────────────
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+# =============================================================================
+# SECTION 3 — Users & Groups
+# =============================================================================
+section "3. Creating users"
+
+SECTION
+
+if [[ -s "$USERS" ]]; then
+  while IFS=' ' read -r username uid homedir shell; do
+    cat >> "$OUTPUT_SCRIPT" << USERBLOCK
+# User: $username  UID=$uid  home=$homedir  shell=$shell
+if ! id '$username' &>/dev/null; then
+  useradd -m -d '$homedir' -s '$shell' -u $uid '$username'
+  # Set password: echo '$username:YOURPASSWORD' | chpasswd
+  ok "Created user: $username"
+else
+  info "User already exists: $username"
+fi
+
+USERBLOCK
+  done < "$USERS"
+else
+  echo 'info "No non-system users to recreate"' >> "$OUTPUT_SCRIPT"
+fi
+
+# ── SECTION 4: CONFIG FILES ───────────────────────────────────────────────────
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+# =============================================================================
+# SECTION 4 — Configuration Files
+# =============================================================================
+# Files are embedded verbatim as heredocs.
+# Review for machine-specific values (IPs, hostnames, UUIDs) before applying.
+section "4. Applying configuration files"
+
+SECTION
+
+while IFS= read -r cfg; do
+  [[ -f "$cfg" ]] || continue
+
+  if file "$cfg" 2>/dev/null | grep -qiE 'binary|ELF|data|image|compiled'; then
+    printf '# SKIPPED (binary): %s\n' "$cfg" >> "$OUTPUT_SCRIPT"
+    continue
+  fi
+
+  fsize=$(stat -c%s "$cfg" 2>/dev/null || echo 0)
+  if [[ "$fsize" -gt 102400 ]]; then
+    printf '# SKIPPED (>100KB): %s\n' "$cfg" >> "$OUTPUT_SCRIPT"
+    continue
+  fi
+
+  cfg_dir=$(dirname "$cfg")
+  cfg_perms=$(stat -c "%a" "$cfg" 2>/dev/null || echo "644")
+  cfg_owner=$(stat -c "%U:%G" "$cfg" 2>/dev/null || echo "root:root")
+
+  # Unique heredoc delimiter per file — prevents content collision
+  DELIM="EOF_$(echo "$cfg" | md5sum | cut -c1-8)"
+
+  cat >> "$OUTPUT_SCRIPT" << CFGMETA
+# ── $cfg ──
+info "Writing $cfg"
+mkdir -p '$cfg_dir'
+cat > '$cfg' << '$DELIM'
+CFGMETA
+
+  cat "$cfg" >> "$OUTPUT_SCRIPT"
+
+  cat >> "$OUTPUT_SCRIPT" << CFGMETA
+$DELIM
+chmod $cfg_perms '$cfg'
+chown $cfg_owner '$cfg'
+ok "Config applied: $cfg"
+
+CFGMETA
+
+done < "$CHANGED_CONFIGS"
+
+# ── SECTION 5: SYSTEMD ────────────────────────────────────────────────────────
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+# =============================================================================
+# SECTION 5 — Systemd Services
+# =============================================================================
+section "5. Enabling systemd services"
+
+SECTION
+
+if [[ -s "$ENABLED_UNITS" ]]; then
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    printf 'systemctl enable --now %q && ok "Enabled: %s" || warn "Could not enable: %s"\n' \
+      "$unit" "$unit" "$unit" >> "$OUTPUT_SCRIPT"
+  done < "$ENABLED_UNITS"
+else
+  echo 'info "No non-default systemd units to enable"' >> "$OUTPUT_SCRIPT"
+fi
+
+# ── SECTION 6: CRON ───────────────────────────────────────────────────────────
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+
+# =============================================================================
+# SECTION 6 — Cron Jobs  (commented out — review & uncomment as needed)
+# =============================================================================
+section "6. Cron jobs — manual review required"
+# Uncomment and adapt lines below, or run: crontab -e
+
+SECTION
+
+if [[ -s "$CRONS" ]]; then
+  while IFS= read -r line; do
+    printf '# %s\n' "$line" >> "$OUTPUT_SCRIPT"
+  done < "$CRONS"
+else
+  echo 'info "No custom cron jobs detected"' >> "$OUTPUT_SCRIPT"
+fi
+
+# ── SECTION 7: FIREWALL ───────────────────────────────────────────────────────
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+
+# =============================================================================
+# SECTION 7 — Firewall Rules  (commented out — review & uncomment as needed)
+# =============================================================================
+section "7. Firewall rules — manual review required"
+
+SECTION
+
+if [[ -s "$FIREWALL" ]]; then
+  while IFS= read -r line; do
+    printf '# %s\n' "$line" >> "$OUTPUT_SCRIPT"
+  done < "$FIREWALL"
+  cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+# To restore iptables: uncomment rules above and pipe to iptables-restore
+# To restore ufw:      ufw enable, then re-add rules with ufw allow/deny
+SECTION
+else
+  echo 'info "No custom firewall rules detected"' >> "$OUTPUT_SCRIPT"
+fi
+
+# ── FINAL BANNER ──────────────────────────────────────────────────────────────
+cat >> "$OUTPUT_SCRIPT" << 'SECTION'
+
+# =============================================================================
+# DONE
+# =============================================================================
+echo ""
+echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${GREEN}║        Reinstall complete!               ║${NC}"
+echo -e "${BOLD}${GREEN}║   Review any warnings printed above.     ║${NC}"
+echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════╝${NC}"
+echo ""
+info "Consider rebooting: systemctl reboot"
+SECTION
+
+chmod +x "$OUTPUT_SCRIPT"
+
+# =============================================================================
+# 12. AUDIT SUMMARY
+# =============================================================================
+section "Audit Complete — Summary"
+
+echo ""
+printf "  %-38s %s\n" "Packages to reinstall:"     "$(wc -l < "$WORK_DIR/packages_to_install.txt")"
+printf "  %-38s %s\n" "Changed config files:"       "$(wc -l < "$CHANGED_CONFIGS")"
+printf "  %-38s %s\n" "Unpackaged /etc files:"      "$(wc -l < "$UNOWNED")"
+printf "  %-38s %s\n" "Non-default systemd units:"  "$(wc -l < "$ENABLED_UNITS")"
+printf "  %-38s %s\n" "Non-system users:"           "$(wc -l < "$USERS")"
+printf "  %-38s %s\n" "Custom APT sources:"         "$(wc -l < "$APT_SOURCES")"
+echo ""
+echo -e "${BOLD}Generated script:${NC} ${GREEN}$(realpath "$OUTPUT_SCRIPT")${NC}"
+echo ""
+echo -e "${YELLOW}Next steps:${NC}"
+echo "  1. Review the generated script section by section"
+echo "  2. SECTION 4 (configs):   check for machine-specific IPs/hostnames"
+echo "  3. SECTION 3 (users):     set passwords manually after creation"
+echo "  4. SECTION 6 (cron):      uncomment only the jobs you need"
+echo "  5. SECTION 7 (firewall):  adapt rules for new hardware/IPs"
+echo "  6. Transfer and run:      sudo bash $OUTPUT_SCRIPT"
+echo ""
